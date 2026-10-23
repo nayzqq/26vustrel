@@ -1,0 +1,6 @@
+venv/
+.env
+*.db
+top10_cache.json
+__pycache__/
+*.pyc

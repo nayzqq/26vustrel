@@ -1,0 +1,79 @@
+name: futures-bot
+
+on:
+  schedule:
+    # раз в 5 минут, со смещением (минуты 3, 8, 13...), чтобы не попадать
+    # на самые загруженные слоты GitHub (начало часа и кратные пяти минуты)
+    - cron: "3-59/5 * * * *"
+  workflow_dispatch:   # ручной запуск кнопкой "Run workflow" и внешний триггер через API
+
+# не даём двум запускам идти одновременно, иначе они затрут состояние друг друга
+concurrency:
+  group: futures-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # нужно, чтобы сохранять базу в ветку "state"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # секреты (Settings -> Secrets and variables -> Actions -> Secrets)
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CRYPTOPANIC_API_KEY: ${{ secrets.CRYPTOPANIC_API_KEY }}
+      # необязательные настройки (Settings -> Secrets and variables -> Actions -> Variables).
+      # Не заданные переменные приходят пустыми, и бот берёт значения по умолчанию.
+      ALERT_WINDOW_MINUTES: ${{ vars.ALERT_WINDOW_MINUTES }}
+      ALERT_COOLDOWN_MINUTES: ${{ vars.ALERT_COOLDOWN_MINUTES }}
+      MARKET_PRICE_SPIKE_PCT: ${{ vars.MARKET_PRICE_SPIKE_PCT }}
+      MARKET_OI_SPIKE_PCT: ${{ vars.MARKET_OI_SPIKE_PCT }}
+      MARKET_FUNDING_EXTREME_PCT: ${{ vars.MARKET_FUNDING_EXTREME_PCT }}
+      MARKET_MIN_SIGNALS: ${{ vars.MARKET_MIN_SIGNALS }}
+      MARKET_RATIO_THRESHOLD: ${{ vars.MARKET_RATIO_THRESHOLD }}
+      NEWS_MIN_SIGNALS: ${{ vars.NEWS_MIN_SIGNALS }}
+      NEWS_RATIO_THRESHOLD: ${{ vars.NEWS_RATIO_THRESHOLD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-actions.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-actions.txt
+
+      - name: Restore state (база из ветки state)
+        run: |
+          if git fetch --depth=1 origin +refs/heads/state:refs/remotes/origin/state; then
+            git show origin/state:futures_bot.db > futures_bot.db || rm -f futures_bot.db
+            git show origin/state:top10_cache.json > top10_cache.json || rm -f top10_cache.json
+            echo "Состояние восстановлено"
+          else
+            echo "Ветки state ещё нет, начинаем с чистого листа"
+          fi
+
+      - name: Run bot (один цикл)
+        run: python run_once.py
+
+      - name: Save state (база в ветку state)
+        if: always()
+        run: |
+          [ -f futures_bot.db ] || { echo "Нет базы, сохранять нечего"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp futures_bot.db /tmp/futures_bot.db
+          cp top10_cache.json /tmp/top10_cache.json 2>/dev/null || true
+          git checkout --orphan state-new
+          git rm -rf . > /dev/null 2>&1 || true
+          cp /tmp/futures_bot.db .
+          cp /tmp/top10_cache.json . 2>/dev/null || true
+          git add -f futures_bot.db
+          git add -f top10_cache.json 2>/dev/null || true
+          git commit -m "state" > /dev/null
+          # каждый раз один свежий коммит без истории, чтобы репозиторий не пух
+          git push --force origin state-new:state
